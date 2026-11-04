@@ -1,8 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "emporio-agent"
 version = "0.1.0"
 description = "Customer service agent prototype for Empório da Música (Artefact AI Engineer case)"
 requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "openai>=1.40",
+    "python-dotenv>=1.0",
+    "pypdf>=4.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+emporio-chat = "emporio_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
