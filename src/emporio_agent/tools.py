@@ -15,7 +15,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from .config import today as store_today
-from .data_loader import StoreData, compact, normalize
+from .data_loader import StoreData, compact, money, normalize
 
 # --------------------------------------------------------------------------- constants
 
@@ -87,9 +87,11 @@ def _money(value: Any) -> float | None:
 # --------------------------------------------------------------------------- tools
 
 class StoreTools:
-    def __init__(self, data: StoreData, today: date | None = None):
+    def __init__(self, data: StoreData, today: date | None = None, policies: Any = None):
+        """`policies` is an optional PolicyIndex; when given, `search_policies` becomes a tool."""
         self.data = data
         self._today = today
+        self.policies = policies
 
     @property
     def today(self) -> date:
@@ -134,7 +136,11 @@ class StoreTools:
         pool = p[(p["category_id"] == row["category_id"]) & p["is_available"] & (p["product_id"] != row["product_id"])]
         price = row["price_brl"]
         pool = pool[(pool["price_brl"] >= price * 0.6) & (pool["price_brl"] <= price * 1.5)]
-        pool = pool.assign(diff=(pool["price_brl"] - price).abs()).sort_values("diff").head(k)
+        # Prefer the same string type (nylon vs steel) first, then the closest price.
+        strings = row["specs"].get("strings")
+        same_type = pool["specs"].apply(lambda s: s.get("strings") == strings)
+        pool = pool.assign(diff=(pool["price_brl"] - price).abs(), other_type=~same_type)
+        pool = pool.sort_values(["other_type", "diff"]).head(k)
         return [self._product_summary(r) for _, r in pool.iterrows()]
 
     # ---------- tool 1
@@ -153,11 +159,18 @@ class StoreTools:
             df = df[df["final_price_brl"] >= float(min_price)]
         if max_price is not None:
             df = df[df["final_price_brl"] <= float(max_price)]
+        tokens = [t for t in normalize(query).split() if t not in STOPWORDS] if query else []
+        hidden: list[dict] = []
         if only_available:
+            # Products that match the query exactly but are out of stock / discontinued would
+            # otherwise vanish, and the model would wrongly say "we don't have that model".
+            if tokens:
+                unavailable = df[~df["is_available"]]
+                full = unavailable["search_text"].apply(lambda text: all(t in text for t in tokens))
+                hidden = [self._product_summary(r) for _, r in unavailable[full].iterrows()]
             df = df[df["is_available"]]
 
         partial = False
-        tokens = [t for t in normalize(query).split() if t not in STOPWORDS] if query else []
         if tokens:
             hits = df["search_text"].apply(lambda text: sum(t in text for t in tokens))
             exact = df[hits == len(tokens)]
@@ -169,11 +182,16 @@ class StoreTools:
 
         df = df.sort_values("final_price_brl") if not partial else df
         limit = max(1, min(int(limit), 20))
-        return {
+        result = {
             "total_found": int(len(df)),
             "partial_match": partial,
             "products": [self._product_summary(r) for _, r in df.head(limit).iterrows()],
         }
+        if hidden:
+            result["unavailable_matches"] = hidden
+            result["note"] = ("Os produtos em unavailable_matches EXISTEM no catálogo, mas estão indisponíveis. "
+                              "Informe isso ao cliente e ofereça alternativas disponíveis.")
+        return result
 
     # ---------- tool 2
 
@@ -220,7 +238,7 @@ class StoreTools:
         n = max_installments(row["final_price_brl"])
         result["payment"] = {
             "max_installments_no_interest": n,
-            "installment_value_brl": round(row["final_price_brl"] / n, 2),
+            "installment_value_brl": money(row["final_price_brl"], 1 / n),
         }
         if not row["is_available"]:
             result["alternatives"] = self._alternatives(row)
@@ -274,7 +292,22 @@ class StoreTools:
         # ASSUMPTION: there is no real delivery date in the data, so for delivered orders
         # estimated_delivery is used as the receipt date (needed for the 7/30-day policies).
         if order["status"] == "delivered" and pd.notna(order["estimated_delivery"]):
-            result["days_since_delivery"] = (self.today - order["estimated_delivery"]).days
+            received = order["estimated_delivery"]
+            days_received = (self.today - received).days
+            days_bought = (self.today - order["order_date"]).days
+            result["delivery_date_assumed"] = str(received)
+            result["delivery_date_note"] = ("Data de recebimento = previsão de entrega (o sistema não registra a "
+                                            "data real). A data do pedido é a data da compra, não da entrega.")
+            result["days_since_delivery"] = days_received
+            # Deadlines from the policy manual, computed here so the model never does date math:
+            # 4.1 arrependimento (7 days after receipt), 4.3 preference exchange (7 days),
+            # 4.2 defect exchange (30 days after purchase), 8.1 legal warranty (90 days after receipt).
+            result["policy_deadlines"] = {
+                "arrependimento_7_dias_apos_recebimento": days_received <= 7,
+                "troca_por_preferencia_7_dias": days_received <= 7,
+                "troca_por_defeito_30_dias_apos_compra": days_bought <= 30,
+                "garantia_legal_90_dias_apos_recebimento": days_received <= 90,
+            }
         if order["status"] in ("pending", "confirmed"):
             days_open = (self.today - order["order_date"]).days
             result["days_since_order"] = days_open
@@ -306,12 +339,18 @@ class StoreTools:
     # ---------- dispatcher
 
     def registry(self) -> dict[str, Callable[..., dict]]:
-        return {
+        tools = {
             "search_products": self.search_products,
             "get_product": self.get_product,
             "get_order_status": self.get_order_status,
             "list_active_promotions": self.list_active_promotions,
         }
+        if self.policies is not None:
+            tools["search_policies"] = self.policies.search_policies
+        return tools
+
+    def schemas(self) -> list[dict]:
+        return tool_schemas(self.data.categories["name"].tolist(), include_policies=self.policies is not None)
 
     def execute(self, name: str, arguments: str | dict | None) -> str:
         """Run a tool by name and always return a JSON string (errors included)."""
@@ -328,8 +367,19 @@ class StoreTools:
 
 # --------------------------------------------------------------------------- schemas (OpenAI format)
 
-def tool_schemas(category_names: list[str]) -> list[dict]:
-    return [
+POLICY_SCHEMA = {"type": "function", "function": {
+    "name": "search_policies",
+    "description": "Busca trechos do manual de políticas da loja: trocas, devoluções, arrependimento, garantia, "
+                   "frete e prazos de entrega, rastreamento, formas de pagamento e parcelamento, regras de promoção, "
+                   "privacidade (LGPD). Use sempre que precisar citar uma regra.",
+    "parameters": {"type": "object", "properties": {
+        "question": {"type": "string", "description": "A dúvida do cliente, reescrita de forma objetiva."},
+    }, "required": ["question"]},
+}}
+
+
+def tool_schemas(category_names: list[str], include_policies: bool = False) -> list[dict]:
+    schemas = [
         {"type": "function", "function": {
             "name": "search_products",
             "description": "Busca produtos no catálogo com filtros. Use para perguntas como "
@@ -367,3 +417,4 @@ def tool_schemas(category_names: list[str]) -> list[dict]:
             "parameters": {"type": "object", "properties": {}},
         }},
     ]
+    return schemas + ([POLICY_SCHEMA] if include_policies else [])

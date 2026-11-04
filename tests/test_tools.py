@@ -132,3 +132,27 @@ def test_execute_returns_json_and_never_raises(tools):
 def test_schemas_cover_all_tools(tools):
     names = {s["function"]["name"] for s in tool_schemas(tools.data.categories["name"].tolist())}
     assert names == set(tools.registry())
+
+
+# ---------- added after the first real run with the model
+
+def test_money_rounds_half_up():
+    from emporio_agent.data_loader import money
+    assert money(459.9, 0.95) == 436.91  # float rounding would give 436.90
+
+
+def test_delivered_order_has_explicit_deadlines(tools):
+    r = tools.get_order_status(2, "thiago.barbosa@jmail.com")
+    assert r["delivery_date_assumed"] == "2025-11-15" and r["order_date"] == "2025-11-02"
+    assert r["policy_deadlines"] == {
+        "arrependimento_7_dias_apos_recebimento": False,
+        "troca_por_preferencia_7_dias": False,
+        "troca_por_defeito_30_dias_apos_compra": False,
+        "garantia_legal_90_dias_apos_recebimento": False,
+    }
+
+
+def test_search_reports_out_of_stock_exact_match(tools):
+    r = tools.search_products(query="Giannini GF-3D", category="Violões")
+    assert 96 not in {p["product_id"] for p in r["products"]}          # not offered as available
+    assert [p["product_id"] for p in r["unavailable_matches"]] == [96]  # but reported as existing

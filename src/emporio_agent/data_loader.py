@@ -14,6 +14,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,13 @@ import pandas as pd
 from .config import DATA_DIR
 
 PIX_DISCOUNT = 0.05
+
+
+def money(value: float, factor: float = 1.0) -> float:
+    """value × factor rounded to cents, half-up, in decimal arithmetic.
+    Plain float rounding turns 459.90 × 0.95 = 436.905 into 436.90 instead of 436.91."""
+    exact = Decimal(str(value)) * Decimal(str(factor))
+    return float(exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def normalize(text: object) -> str:
@@ -80,9 +88,11 @@ def _clean_products(products: pd.DataFrame, categories: pd.DataFrame, promotions
     df = df.merge(active, on="product_id", how="left")
 
     has_promo = df["discount_percent"].notna()
-    df["promo_price_brl"] = (df["price_brl"] * (1 - df["discount_percent"] / 100)).round(2).where(has_promo)
+    df["promo_price_brl"] = df.apply(
+        lambda r: money(r["price_brl"], 1 - r["discount_percent"] / 100) if pd.notna(r["discount_percent"]) else None,
+        axis=1).astype(float)
     df["final_price_brl"] = df["promo_price_brl"].fillna(df["price_brl"])
-    df["pix_price_brl"] = (df["price_brl"] * (1 - PIX_DISCOUNT)).round(2).where(~has_promo)
+    df["pix_price_brl"] = df["price_brl"].apply(lambda v: money(v, 1 - PIX_DISCOUNT)).where(~has_promo)
 
     df["is_available"] = (df["status"] == "active") & (df["stock_quantity"] > 0)
     df["search_text"] = (
